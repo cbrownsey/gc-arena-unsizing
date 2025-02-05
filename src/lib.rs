@@ -15,6 +15,7 @@ pub mod dynamic_roots;
 mod gc;
 mod gc_weak;
 pub mod lock;
+mod meta_sized;
 pub mod metrics;
 mod no_drop;
 mod static_collect;

@@ -1,9 +1,10 @@
-use core::alloc::Layout;
+use core::alloc::{Layout, LayoutError};
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::{mem, ptr};
 
+use crate::meta_sized::MetaSized;
 use crate::{collect::Collect, context::Context};
 
 /// A thin-pointer-sized box containing a type-erased GC object.
@@ -25,16 +26,41 @@ impl GcBox {
         Self(NonNull::new_unchecked(erased))
     }
 
-    /// Gets a pointer to the value stored inside this box.
-    /// `T` must be the same type that was used with `erase`, so that
-    /// we can correctly compute the field offset.
-    #[inline(always)]
-    fn unerased_value<T>(&self) -> *mut T {
+    // / Gets a pointer to the value stored inside this box.
+    // / `T` must be the same type that was used with `erase`, so that
+    // / we can correctly compute the field offset.
+    // #[deprecated]
+    // #[inline(always)]
+    // fn unerased_value<T>(&self) -> *mut T {
+    //     unsafe {
+    //         let ptr = self.0.as_ptr() as *mut GcBoxInner<T>;
+    //         // Don't create a reference, to keep the full provenance.
+    //         // Also, this gives us interior mutability "for free".
+    //         ptr::addr_of_mut!((*ptr).value) as *mut T
+    //     }
+    // }
+
+    unsafe fn typed_ptr<T: ?Sized + MetaSized>(&self) -> *mut T {
+        let metadata = self.typed_metadata::<T>();
+
+        // this is sound, since the metadata of an unsized struct is identical to the metadata of its unsized field.
+        let ptr =
+            T::from_parts_mut(self.0.as_ptr().cast::<()>(), metadata) as *mut GcBoxInner<T, ()>;
+
+        // Safety: A `GcBox` must always point to the second field of a valid
+        // `GcBoxInner<T, T::Metadata>`. This necessarily means that it also points to the first
+        // field of a valid `GcBoxInner<T , ()>`.
+        (unsafe { &raw mut (*ptr).value }) as *mut T
+    }
+
+    unsafe fn typed_metadata<T: ?Sized + MetaSized>(&self) -> T::Metadata {
+        // Safety: A `GcBox` must always point to the second field of a valid `GcBoxInner<T, T::Metadata>`.
         unsafe {
-            let ptr = self.0.as_ptr() as *mut GcBoxInner<T>;
-            // Don't create a reference, to keep the full provenance.
-            // Also, this gives us interior mutability "for free".
-            ptr::addr_of_mut!((*ptr).value) as *mut T
+            self.0
+                .as_ptr()
+                .byte_sub(GcBoxInner::<T>::metadata_offset().unwrap())
+                .cast::<T::Metadata>()
+                .read()
         }
     }
 
@@ -67,10 +93,16 @@ impl GcBox {
     /// pointers again.
     #[inline(always)]
     pub(crate) unsafe fn dealloc(self) {
-        let layout = self.header().vtable().box_layout;
+        // let layout = self.header().vtable().box_layout_old;
+        let layout = (self.header().vtable().box_layout)(self);
+
         let ptr = self.0.as_ptr() as *mut u8;
         // SAFETY: the pointer was `Box`-allocated with this layout.
         alloc::alloc::dealloc(ptr, layout);
+    }
+
+    pub(crate) fn size_of_box(&self) -> usize {
+        unsafe { (self.header().vtable().box_layout)(*self) }.size()
     }
 }
 
@@ -88,17 +120,19 @@ pub(crate) struct GcBoxHeader {
 
 impl GcBoxHeader {
     #[inline(always)]
-    pub fn new<'gc, T: Collect<'gc>>() -> Self {
+    pub fn new<'gc, T: ?Sized + MetaSized + Collect<'gc>>() -> Self {
         // Helper trait to materialize vtables in static memory.
-        trait HasCollectVtable {
-            const VTABLE: CollectVtable;
-        }
+        // trait HasCollectVtable {
+        //     const VTABLE: CollectVtable;
+        // }
 
-        impl<'gc, T: Collect<'gc>> HasCollectVtable for T {
-            const VTABLE: CollectVtable = CollectVtable::vtable_for::<T>();
-        }
+        // impl<'gc, T: Collect<'gc>> HasCollectVtable for T {
+        //     const VTABLE: CollectVtable = CollectVtable::vtable_for::<T>();
+        // }
 
-        let vtable: &'static _ = &<T as HasCollectVtable>::VTABLE;
+        // let vtable: &'static _ = &<T as HasCollectVtable>::VTABLE;
+
+        let vtable: &'static _ = CollectVtable::vtable_for::<T>();
         Self {
             next: Cell::new(None),
             tagged_vtable: Cell::new(vtable as *const _),
@@ -127,11 +161,12 @@ impl GcBoxHeader {
         self.next.set(next)
     }
 
-    /// Returns the (shallow) size occupied by this box in memory.
-    #[inline(always)]
-    pub(crate) fn size_of_box(&self) -> usize {
-        self.vtable().box_layout.size()
-    }
+    // / Returns the (shallow) size occupied by this box in memory.
+    // #[inline(always)]
+    // #[deprecated]
+    // pub(crate) fn size_of_box(&self) -> usize {
+    //     panic!()
+    // }
 
     #[inline]
     pub(crate) fn color(&self) -> GcColor {
@@ -189,7 +224,7 @@ impl GcBoxHeader {
 #[repr(align(16))]
 struct CollectVtable {
     /// The layout of the `GcBox` the GC'd value is stored in.
-    box_layout: Layout,
+    box_layout: unsafe fn(GcBox) -> Layout,
     /// Drops the value stored in the given `GcBox` (without deallocating the box).
     drop_value: unsafe fn(GcBox),
     /// Traces the value stored in the given `GcBox`.
@@ -197,18 +232,44 @@ struct CollectVtable {
 }
 
 impl CollectVtable {
-    /// Makes a vtable for a known, `Sized` type.
-    /// Because `T: Sized`, we can recover a typed pointer
+    // / Makes a vtable for a known, `Sized` type.
+    // / Because `T: Sized`, we can recover a typed pointer
+    // / directly from the erased `GcBox`.
+    // #[inline(always)]
+    // #[deprecated]
+    // const fn vtable_for<'gc, T: Collect<'gc>>() -> Self {
+    //     Self {
+    //         box_layout_old: Layout::new::<GcBoxInner<T>>(),
+    //         box_layout: |_| Layout::new::<T>(),
+    //         drop_value: |erased| unsafe {
+    //             ptr::drop_in_place(erased.unerased_value::<T>());
+    //         },
+    //         trace_value: |erased, cc| unsafe {
+    //             let val = &*(erased.unerased_value::<T>());
+    //             val.trace(cc)
+    //         },
+    //     }
+    // }
+
+    /// Makes a vtable for a known, `Unsized` type.
+    /// Because `T: MetaSized`, we can recover a typed pointer
     /// directly from the erased `GcBox`.
-    #[inline(always)]
-    const fn vtable_for<'gc, T: Collect<'gc>>() -> Self {
-        Self {
-            box_layout: Layout::new::<GcBoxInner<T>>(),
+    const fn vtable_for<'gc, T: ?Sized + MetaSized + Collect<'gc>>() -> &'static Self {
+        &Self {
+            box_layout: |erased| {
+                let meta = unsafe { erased.typed_metadata::<T>() };
+
+                let layout = Layout::new::<T::Metadata>();
+                let (layout, _) = layout.extend(Layout::new::<GcBoxHeader>()).unwrap();
+                let (layout, _) = layout.extend(T::layout_from_meta(meta).unwrap()).unwrap();
+
+                layout.pad_to_align()
+            },
             drop_value: |erased| unsafe {
-                ptr::drop_in_place(erased.unerased_value::<T>());
+                ptr::drop_in_place(erased.typed_ptr::<T>());
             },
             trace_value: |erased, cc| unsafe {
-                let val = &*(erased.unerased_value::<T>());
+                let val = &*(erased.typed_ptr::<T>());
                 val.trace(cc)
             },
         }
@@ -219,7 +280,11 @@ impl CollectVtable {
 /// This type is never manipulated directly by the GC algorithm, allowing
 /// user-facing `Gc`s to freely cast their pointer to it.
 #[repr(C)]
-pub(crate) struct GcBoxInner<T: ?Sized> {
+pub(crate) struct GcBoxInner<T: ?Sized, M = ()> {
+    /// The metadata associated with the value stored in this `GcBox`. This
+    /// field is usually never read or written, except when the `GcBox` is
+    /// being created or dropped.
+    pub(crate) metadata: M,
     pub(crate) header: GcBoxHeader,
     /// The typed value stored in this `GcBox`.
     pub(crate) value: mem::ManuallyDrop<T>,
@@ -229,9 +294,18 @@ impl<'gc, T: Collect<'gc>> GcBoxInner<T> {
     #[inline(always)]
     pub(crate) fn new(header: GcBoxHeader, t: T) -> Self {
         Self {
+            metadata: (),
             header,
             value: mem::ManuallyDrop::new(t),
         }
+    }
+}
+
+impl<'gc, T: ?Sized + MetaSized> GcBoxInner<T> {
+    pub(crate) fn metadata_offset() -> Result<usize, LayoutError> {
+        let layout = Layout::new::<T::Metadata>();
+        let (_, offset) = layout.extend(Layout::new::<GcBoxHeader>())?;
+        Ok(offset)
     }
 }
 

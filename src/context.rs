@@ -206,9 +206,9 @@ impl Drop for Context {
                 if let Some(gc_box) = self.1.take() {
                     let mut drop_resume = DropAll(self.0, Some(gc_box));
                     while let Some(mut gc_box) = drop_resume.1.take() {
+                        let gc_size = gc_box.size_of_box();
                         let header = gc_box.header();
                         drop_resume.1 = header.next();
-                        let gc_size = header.size_of_box();
                         // SAFETY: the context owns its GC'd objects
                         unsafe {
                             if header.is_live() {
@@ -371,8 +371,6 @@ impl Context {
         header.set_live(true);
         header.set_needs_trace(T::NEEDS_TRACE);
 
-        let alloc_size = header.size_of_box();
-
         // Make the generated code easier to optimize into `T` being constructed in place or at the
         // very least only memcpy'd once.
         // For more information, see: https://github.com/kyren/gc-arena/pull/14
@@ -382,6 +380,8 @@ impl Context {
             let ptr = NonNull::new_unchecked(Box::into_raw(uninitialized) as *mut GcBoxInner<T>);
             (GcBox::erase(ptr), ptr)
         };
+
+        let alloc_size = gc_box.size_of_box();
 
         self.all.set(Some(gc_box));
         if self.phase == Phase::Sweep && self.sweep_prev.get().is_none() {
@@ -494,7 +494,7 @@ impl Context {
 
                 // Only marking the *first* time counts as a mark metric.
                 if color == GcColor::White {
-                    self.metrics.mark_gc_marked(header.size_of_box());
+                    self.metrics.mark_gc_marked(gc_box.size_of_box());
                 }
             }
         }
@@ -505,7 +505,7 @@ impl Context {
         let header = gc_box.header();
         if header.color() == GcColor::White {
             header.set_color(GcColor::WhiteWeak);
-            self.metrics.mark_gc_marked(header.size_of_box());
+            self.metrics.mark_gc_marked(gc_box.size_of_box());
         }
     }
 
@@ -568,7 +568,7 @@ impl Context {
             self.gray.push(gc_box);
             // Only marking the *first* time counts as a mark metric.
             if color == GcColor::White {
-                self.metrics.mark_gc_marked(header.size_of_box());
+                self.metrics.mark_gc_marked(gc_box.size_of_box());
             }
         }
     }
@@ -589,7 +589,7 @@ impl Context {
             // We always mark work for objects processed from both the gray and "gray again" queue.
             // When objects are placed into the "gray again" queue due to a write barrier, the
             // original work is *undone*, so we do it again here.
-            self.metrics.mark_gc_traced(gc_box.header().size_of_box());
+            self.metrics.mark_gc_traced(gc_box.size_of_box());
             gc_box.header().set_color(GcColor::Black);
 
             // If we have an object in the gray queue, take one, trace it, and turn it black.
@@ -639,7 +639,7 @@ impl Context {
         };
 
         let sweep_header = sweep.header();
-        let sweep_size = sweep_header.size_of_box();
+        let sweep_size = sweep.size_of_box();
 
         let next_box = sweep_header.next();
         self.sweep = next_box;
@@ -712,7 +712,7 @@ impl Context {
         debug_assert_eq!(header.color(), GcColor::Black);
         header.set_color(GcColor::Gray);
         self.gray_again.push(gc_box);
-        self.metrics.mark_gc_untraced(header.size_of_box());
+        self.metrics.mark_gc_untraced(gc_box.size_of_box());
     }
 }
 
