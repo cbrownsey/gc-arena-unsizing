@@ -40,12 +40,27 @@ impl GcBox {
     //     }
     // }
 
+    /// Gets a pointer to the value stored inside this `GcBox`. The returned
+    /// pointer will have the metadata of the originally allocated object. If
+    /// an alternative metadata is required, use [`typed_ptr_with`].
+    ///
+    /// **SAFETY:** The value stored in the `GcBox` must be readable as the type `T`, and
+    /// the metadata associated with that value must be readable as, and have
+    /// the same size and alignment as `T::Metadata`.
     unsafe fn typed_ptr<T: ?Sized + MetaSized>(&self) -> *mut T {
-        let metadata = self.typed_metadata::<T>();
+        self.typed_ptr_with(self.typed_metadata::<T>())
+    }
 
+    /// Gets a pointer to the value stored inside this `GcBox`, with the given
+    /// metadata.
+    ///
+    /// **SAFETY**:
+    /// - The alignment of the value stored in the `GcBox` must be equal to the alignment of `T`.
+    /// - The size of the value stored in the `GcBox` must be less than or equal to than the size
+    ///   of `T`.
+    unsafe fn typed_ptr_with<T: ?Sized + MetaSized>(&self, meta: T::Metadata) -> *mut T {
         // this is sound, since the metadata of an unsized struct is identical to the metadata of its unsized field.
-        let ptr =
-            T::from_parts_mut(self.0.as_ptr().cast::<()>(), metadata) as *mut GcBoxInner<T, ()>;
+        let ptr = T::from_parts_mut(self.0.as_ptr().cast::<()>(), meta) as *mut GcBoxInner<T, ()>;
 
         // Safety: A `GcBox` must always point to the second field of a valid
         // `GcBoxInner<T, T::Metadata>`. This necessarily means that it also points to the first
@@ -53,6 +68,9 @@ impl GcBox {
         (unsafe { &raw mut (*ptr).value }) as *mut T
     }
 
+    /// Copies the metadata associated with this `GcBox`.
+    ///
+    /// **SAFETY:** The metadata value stored in the `GcBox` must have the exact same layout as `T`.
     unsafe fn typed_metadata<T: ?Sized + MetaSized>(&self) -> T::Metadata {
         // Safety: A `GcBox` must always point to the second field of a valid `GcBoxInner<T, T::Metadata>`.
         unsafe {
@@ -94,15 +112,17 @@ impl GcBox {
     #[inline(always)]
     pub(crate) unsafe fn dealloc(self) {
         // let layout = self.header().vtable().box_layout_old;
-        let layout = (self.header().vtable().box_layout)(self);
+        let (layout, offset) = (self.header().vtable().box_layout)(self);
 
-        let ptr = self.0.as_ptr() as *mut u8;
+        let ptr = (self.0.as_ptr() as *mut u8).byte_sub(offset);
         // SAFETY: the pointer was `Box`-allocated with this layout.
         alloc::alloc::dealloc(ptr, layout);
     }
 
     pub(crate) fn size_of_box(&self) -> usize {
-        unsafe { (self.header().vtable().box_layout)(*self) }.size()
+        unsafe { (self.header().vtable().box_layout)(*self) }
+            .0
+            .size()
     }
 }
 
@@ -215,6 +235,20 @@ impl GcBoxHeader {
     pub(crate) fn set_live(&self, alive: bool) {
         tagged_ptr::set_bool::<0x8, _>(&self.tagged_vtable, alive);
     }
+
+    /// Sets the vtable stored in this `GcBox` to the vtable for the given type.
+    ///
+    /// # Safety
+    /// The new vtable must be valid for the new type. This means that a pointer
+    #[inline]
+    pub(crate) unsafe fn set_vtable<'gc, T: ?Sized + MetaSized + Collect<'gc>>(&self) {
+        let tag = tagged_ptr::get::<0xF, _>(self.tagged_vtable.get());
+        let new_vtable = CollectVtable::vtable_for::<T>();
+
+        let tagged = tagged_ptr::tagged::<0xF, _>(new_vtable, tag);
+
+        self.tagged_vtable.set(tagged);
+    }
 }
 
 /// Type-specific operations for GC'd values.
@@ -223,8 +257,9 @@ impl GcBoxHeader {
 /// The type is over-aligned so that `GcBoxHeader` can store flags into the LSBs of the vtable pointer.
 #[repr(align(16))]
 struct CollectVtable {
-    /// The layout of the `GcBox` the GC'd value is stored in.
-    box_layout: unsafe fn(GcBox) -> Layout,
+    /// Computes the layout of the `GcBox` the GC'd value is stored in and the offset, in bytes,
+    /// from the start of the metadata field to the start of the `GcBoxHeader`.
+    box_layout: unsafe fn(GcBox) -> (Layout, usize),
     /// Drops the value stored in the given `GcBox` (without deallocating the box).
     drop_value: unsafe fn(GcBox),
     /// Traces the value stored in the given `GcBox`.
@@ -259,11 +294,16 @@ impl CollectVtable {
             box_layout: |erased| {
                 let meta = unsafe { erased.typed_metadata::<T>() };
 
-                let layout = Layout::new::<T::Metadata>();
-                let (layout, _) = layout.extend(Layout::new::<GcBoxHeader>()).unwrap();
-                let (layout, _) = layout.extend(T::layout_from_meta(meta).unwrap()).unwrap();
+                let Ok((layout, offset)) = (|| -> Result<(Layout, usize), LayoutError> {
+                    let layout = GcBoxInner::<T>::box_layout(meta)?;
+                    let offset = GcBoxInner::<T>::metadata_offset()?;
 
-                layout.pad_to_align()
+                    Ok((layout, offset))
+                })() else {
+                    panic!()
+                };
+
+                (layout, offset)
             },
             drop_value: |erased| unsafe {
                 ptr::drop_in_place(erased.typed_ptr::<T>());
@@ -302,10 +342,25 @@ impl<'gc, T: Collect<'gc>> GcBoxInner<T> {
 }
 
 impl<'gc, T: ?Sized + MetaSized> GcBoxInner<T> {
+    pub(crate) fn from_box_parts_mut(ptr: *mut (), meta: T::Metadata) -> *mut GcBoxInner<T> {
+        T::from_parts_mut(ptr, meta) as *mut GcBoxInner<T>
+    }
+
+    pub(crate) fn box_parts_mut(this: *mut GcBoxInner<T>) -> (*mut (), T::Metadata) {
+        T::into_parts_mut(this as *mut T)
+    }
+
     pub(crate) fn metadata_offset() -> Result<usize, LayoutError> {
         let layout = Layout::new::<T::Metadata>();
         let (_, offset) = layout.extend(Layout::new::<GcBoxHeader>())?;
         Ok(offset)
+    }
+
+    pub(crate) fn box_layout(meta: T::Metadata) -> Result<Layout, LayoutError> {
+        let layout = Layout::new::<T::Metadata>();
+        let (layout, _) = layout.extend(Layout::new::<GcBoxHeader>())?;
+        let (layout, _) = layout.extend(T::layout_from_meta(meta)?)?;
+        Ok(layout.pad_to_align())
     }
 }
 
@@ -358,6 +413,11 @@ mod tagged_ptr {
         ($type:ty, $mask:expr) => {
             let _ = <$type as ValidMask<$mask>>::CHECK;
         };
+    }
+
+    pub(super) fn tagged<const MASK: usize, T>(ptr: *const T, tag: usize) -> *const T {
+        check_mask!(T, MASK);
+        ptr.map_addr(|addr| (addr & !MASK) | (tag & MASK))
     }
 
     #[inline(always)]

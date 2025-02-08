@@ -1,13 +1,14 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     cell::{Cell, UnsafeCell},
-    mem,
+    mem::{self, ManuallyDrop},
     ops::{ControlFlow, Deref, DerefMut},
     ptr::NonNull,
 };
 
 use crate::{
     collect::{Collect, Trace},
+    meta_sized::MetaSized,
     metrics::Metrics,
     types::{GcBox, GcBoxHeader, GcBoxInner, GcColor, Invariant},
     Gc, GcWeak,
@@ -86,7 +87,16 @@ impl<'gc> Mutation<'gc> {
 
     #[inline]
     pub(crate) fn allocate<T: Collect<'gc> + 'gc>(&self, t: T) -> NonNull<GcBoxInner<T>> {
-        self.context.allocate(t)
+        let ptr = unsafe { self.allocate_metasized::<T>(()) };
+        unsafe { (&raw mut (*ptr.as_ptr()).value).write(ManuallyDrop::new(t)) };
+        ptr
+    }
+
+    pub(crate) unsafe fn allocate_metasized<T>(&self, meta: T::Metadata) -> NonNull<GcBoxInner<T>>
+    where
+        T: ?Sized + MetaSized + Collect<'gc> + 'gc,
+    {
+        unsafe { self.context.allocate_metasized(meta) }
     }
 
     #[inline]
@@ -365,32 +375,59 @@ impl Context {
         cx.log_progress("GC: yielding...");
     }
 
-    fn allocate<'gc, T: Collect<'gc>>(&self, t: T) -> NonNull<GcBoxInner<T>> {
+    /// Allocates a box using the given metadata. The boxes value is left uninitialized.
+    ///
+    /// **SAFETY:** The returned `GcBoxInner` must be written to, or must have a drop
+    /// implementation which may be called on uninitialized data. Such as `MaybeUninit<T>`.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    unsafe fn allocate_metasized<'gc, T>(&self, meta: T::Metadata) -> NonNull<GcBoxInner<T>>
+    where
+        T: ?Sized + MetaSized + Collect<'gc>,
+    {
         let header = GcBoxHeader::new::<T>();
         header.set_next(self.all.get());
         header.set_live(true);
         header.set_needs_trace(T::NEEDS_TRACE);
 
-        // Make the generated code easier to optimize into `T` being constructed in place or at the
-        // very least only memcpy'd once.
-        // For more information, see: https://github.com/kyren/gc-arena/pull/14
-        let (gc_box, ptr) = unsafe {
-            let mut uninitialized = Box::new(mem::MaybeUninit::<GcBoxInner<T>>::uninit());
-            core::ptr::write(uninitialized.as_mut_ptr(), GcBoxInner::new(header, t));
-            let ptr = NonNull::new_unchecked(Box::into_raw(uninitialized) as *mut GcBoxInner<T>);
-            (GcBox::erase(ptr), ptr)
+        let box_layout = GcBoxInner::<T>::box_layout(meta).unwrap();
+        // Safety: `GcBoxInner::box_layout` must always return a layout of non-zero size.
+        let ptr = unsafe { alloc::alloc::alloc(box_layout) };
+
+        if ptr.is_null() {
+            alloc::alloc::handle_alloc_error(box_layout)
+        }
+
+        let gc_box = GcBoxInner::<(), T::Metadata> {
+            metadata: meta,
+            header,
+            value: ManuallyDrop::new(()),
         };
 
-        let alloc_size = gc_box.size_of_box();
+        // Safety: `GcBoxInner` is `#[repr(C)]` and so the last field can be omitted.
+        unsafe { ptr.cast::<GcBoxInner<(), T::Metadata>>().write(gc_box) };
+
+        let metadata_offset = GcBoxInner::<T>::metadata_offset().unwrap();
+        // Safety: `metadata_offset` is the number of bytes required to point to the second field,
+        // and a pointer to the second field of a `GcBoxInner<T, T::Metadata>` may be interpreted
+        // as a `GcBoxInner<T>`.
+        let box_ptr = GcBoxInner::<T>::from_box_parts_mut(
+            unsafe { ptr.byte_add(metadata_offset) }.cast(),
+            meta,
+        );
+
+        // Safety: ptr was already checked to be non-null.
+        let box_ptr = unsafe { NonNull::new_unchecked(box_ptr) };
+        // Safety: Initialization is done above.
+        let gc_box = unsafe { GcBox::erase(box_ptr) };
 
         self.all.set(Some(gc_box));
         if self.phase == Phase::Sweep && self.sweep_prev.get().is_none() {
             self.sweep_prev.set(self.all.get());
         }
 
-        self.metrics.mark_gc_allocated(alloc_size);
+        self.metrics.mark_gc_allocated(box_layout.size());
 
-        ptr
+        box_ptr
     }
 
     #[inline]

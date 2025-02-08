@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 #[cfg(feature = "std")]
 use std::collections::{HashMap, HashSet};
 
@@ -259,6 +260,14 @@ unsafe impl<'gc, T> Collect<'gc> for RefCell<T>
 where
     T: 'static,
 {
+    const NEEDS_TRACE: bool = false;
+}
+
+/// For the purposes of tracing, a `MaybeUninit` is assumed to always be uninitialized. This means
+/// that the collector will never actually trace its contents. Therefore it will likely cause
+/// undefined behaviour to read a garbage collected pointer from the `MaybeUninit`, if it was set
+/// in a prior mutation.
+unsafe impl<'gc, T> Collect<'gc> for MaybeUninit<T> {
     const NEEDS_TRACE: bool = false;
 }
 
