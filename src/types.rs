@@ -341,7 +341,7 @@ impl<'gc, T: Collect<'gc>> GcBoxInner<T> {
     }
 }
 
-impl<'gc, T: ?Sized + MetaSized> GcBoxInner<T> {
+impl<T: ?Sized + MetaSized> GcBoxInner<T> {
     pub(crate) fn from_box_parts_mut(ptr: *mut (), meta: T::Metadata) -> *mut GcBoxInner<T> {
         T::from_parts_mut(ptr, meta) as *mut GcBoxInner<T>
     }

@@ -1,5 +1,4 @@
-#![deny(unsafe_op_in_unsafe_fn)]
-#![warn(clippy::undocumented_unsafe_blocks)]
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 use core::{
     alloc::Layout,
@@ -54,27 +53,37 @@ impl<'gc, T: ?Sized + 'gc> Deref for UniqueGc<'gc, T> {
 
     #[inline]
     fn deref(&self) -> &T {
+        // SAFETY: Since `self` is immutably borrowed, and by `UniqueGc`'s
+        // invariants, we can soundly materialise an immutable reference to
+        // `value`.
         unsafe { &self.ptr.as_ref().value }
     }
 }
 
 impl<'gc, T: ?Sized + 'gc> DerefMut for UniqueGc<'gc, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: Since `self` is mutably borrowed, and by `UniqueGc`'s
+        // invariants, we can soundly materialise a mutable reference to
+        // `value`.
         unsafe { &mut self.ptr.as_mut().value }
     }
 }
 
 impl<'gc, T: ?Sized + 'gc> AsRef<T> for UniqueGc<'gc, T> {
-    #[inline]
     fn as_ref(&self) -> &T {
-        unsafe { &self.ptr.as_ref().value }
+        self
+    }
+}
+
+impl<'gc, T: ?Sized + 'gc> AsMut<T> for UniqueGc<'gc, T> {
+    fn as_mut(&mut self) -> &mut T {
+        self
     }
 }
 
 impl<'gc, T: ?Sized + 'gc> Borrow<T> for UniqueGc<'gc, T> {
-    #[inline]
     fn borrow(&self) -> &T {
-        unsafe { &self.ptr.as_ref().value }
+        self
     }
 }
 
@@ -145,6 +154,7 @@ impl<'gc, T: Collect<'gc>> UniqueGc<'gc, T> {
     pub fn new_zeroed(mc: &Mutation<'gc>) -> UniqueGc<'gc, MaybeUninit<T>> {
         let mut gc = UniqueGc::<T>::new_uninit(mc);
 
+        // SAFETY: Value is stored in a `MaybeUninit`.
         unsafe { gc.as_mut_ptr().write_bytes(0x00, 1) };
 
         gc
@@ -173,6 +183,7 @@ impl<'gc, T: Collect<'gc>> UniqueGc<'gc, [T]> {
     /// # });
     /// ```
     pub fn new_uninit_slice(mc: &Mutation<'gc>, len: usize) -> UniqueGc<'gc, [MaybeUninit<T>]> {
+        // SAFETY: `[MaybeUninit<_>]` may be entirely unintialized.
         let ptr = unsafe { mc.allocate_metasized::<[MaybeUninit<T>]>(len) };
 
         UniqueGc {
@@ -196,6 +207,7 @@ impl<'gc, T: Collect<'gc>> UniqueGc<'gc, [T]> {
     pub fn new_zeroed_slice(mc: &Mutation<'gc>, len: usize) -> UniqueGc<'gc, [MaybeUninit<T>]> {
         let mut gc = UniqueGc::new_uninit_slice(mc, len);
 
+        // SAFETY: `[MaybeUninit<T>]` may be safely set to zero bytes.
         unsafe { gc.as_mut_ptr().write_bytes(0x00, len) };
 
         gc
@@ -223,8 +235,15 @@ impl<'gc, T: Collect<'gc>> UniqueGc<'gc, [T]> {
     {
         let mut gc = UniqueGc::new_uninit_slice(mc, s.len());
 
+        // SAFETY:
+        // - `s` and `gc` cannot be overlapping as `gc` was freshly allocated.
+        // - `s` is valid for reads of `s.len() * size_of::<T>()` bytes.
+        // - `gc` is allocated with length `s.len()` and so is valid for writes
+        //   of `s.len() * size_of::<T>()` bytes.
+        // - This cannot cause double drops, as `T: Copy`.
         unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), gc.as_mut_ptr().cast::<T>(), s.len()) };
 
+        // SAFETY: `gc` was initialized above.
         unsafe { gc.assume_init() }
     }
 
@@ -253,6 +272,7 @@ impl<'gc, T: Collect<'gc>> UniqueGc<'gc, [T]> {
             place.write(val.clone());
         }
 
+        // SAFETY: `gc` was initialized above.
         unsafe { gc.assume_init() }
     }
 
@@ -360,6 +380,7 @@ impl<'gc, T: Collect<'gc>> UniqueGc<'gc, [MaybeUninit<T>]> {
     /// # });
     /// ```
     pub unsafe fn assume_init(self) -> UniqueGc<'gc, [T]> {
+        // SAFETY: `[MaybeUninit<T>]` is guaranteed to have the same layout as `[T]`.
         unsafe { self.transmute() }
     }
 }
@@ -370,6 +391,7 @@ impl<'gc, T: ?Sized + 'gc> UniqueGc<'gc, T> {
     /// Very few guarantees are given about this pointer, except that it is properly
     /// aligned, points to a valid instance of `T`, and may be written to.
     pub fn as_mut_ptr(this: &mut UniqueGc<'gc, T>) -> *mut T {
+        // SAFETY: `UniqueGc` is guaranteed to contain a pointer to a valid instance of a `GcBoxInner<T>`.
         unsafe {
             let inner = this.ptr.as_ptr();
             (&raw mut (*inner).value) as *mut T
@@ -381,6 +403,7 @@ impl<'gc, T: ?Sized + 'gc> UniqueGc<'gc, T> {
     /// Very few guarantees are given about this pointer, except that it is properly
     /// aligned, and points to a valid instance of `T`
     pub fn as_ptr(this: &UniqueGc<'gc, T>) -> *const T {
+        // SAFETY: `UniqueGc` is guaranteed to contain a pointer to a valid instance of a `GcBoxInner<T>`.
         unsafe {
             let inner = this.ptr.as_ptr();
             (&raw const (*inner).value) as *mut T
@@ -395,10 +418,16 @@ impl<'gc, T: ?Sized + 'gc> UniqueGc<'gc, T> {
     /// which point to the same allocation. This is always the case for [`UniqueGc::as_ptr`].
     pub unsafe fn from_raw(raw: *mut T) -> UniqueGc<'gc, T> {
         let layout = Layout::new::<GcBoxHeader>();
+        // SAFETY: A precondition of this function is that `raw` must point to
+        // the `value` field of a valid `GcBoxInner`.
         let (_, header_offset) = layout.extend(Layout::for_value(unsafe { &*raw })).unwrap();
         let header_offset = -(header_offset as isize);
-        let ptr = unsafe { (raw as *mut T).byte_offset(header_offset) as *mut GcBoxInner<T> };
+        // SAFETY: The given pointer must point to the `value` field of a valid
+        // `GcBoxInner`, and `header_offset` is the number of bytes between the
+        // `value` field, and the start of a `GcBoxInner<T>`.
+        let ptr = unsafe { raw.byte_offset(header_offset) as *mut GcBoxInner<T> };
         UniqueGc {
+            // SAFETY: Function precondition.
             ptr: unsafe { NonNull::new_unchecked(ptr) },
             _invariant: PhantomData,
         }
@@ -406,6 +435,7 @@ impl<'gc, T: ?Sized + 'gc> UniqueGc<'gc, T> {
 
     /// Converts the `UniqueGc` into a regular [`Gc`].
     pub fn into_gc(this: UniqueGc<'gc, T>) -> Gc<'gc, T> {
+        // SAFETY: Trivial.
         unsafe { Gc::from_ptr(UniqueGc::as_ptr(&this)) }
     }
 }
@@ -416,8 +446,7 @@ impl<'gc, T: ?Sized + MetaSized> UniqueGc<'gc, T> {
     /// This is not a shallow pointer based transmutation, this changes the v-table as well.
     ///
     /// # Safety
-    /// - The type `U` must have metadata with the same size and alignment of `T`'s metadata.
-    /// - A pointer to `T`` must point to a value with the same size and alignment as that same
+    /// - A pointer to `T` must point to a value with the same size and alignment as that same
     ///   pointer bitwise interpreted to a pointer to `U`.
     pub(crate) unsafe fn transmute<U: ?Sized + MetaSized<Metadata = T::Metadata> + Collect<'gc>>(
         self,
@@ -426,11 +455,13 @@ impl<'gc, T: ?Sized + MetaSized> UniqueGc<'gc, T> {
 
         let u_ptr = <GcBoxInner<U>>::from_box_parts_mut(ptr, meta);
 
+        // SAFETY: The safety of this call is a precondition of this function.
         unsafe {
-            (&*u_ptr.cast::<GcBoxHeader>()).set_vtable::<U>();
+            (*u_ptr.cast::<GcBoxHeader>()).set_vtable::<U>();
         }
 
         UniqueGc {
+            // SAFETY: `u_ptr` is the same pointer which came from `self`, and so must not be null.
             ptr: unsafe { NonNull::new_unchecked(u_ptr) },
             _invariant: PhantomData,
         }
@@ -448,7 +479,7 @@ mod test {
     fn unique_gc_drops() {
         use std::{cell::Cell, thread_local};
         thread_local! {
-            static DROPPED: Cell<bool> = Cell::new(false);
+            static DROPPED: Cell<bool> = const { Cell::new(false) };
         }
 
         struct DropWatcher;
@@ -459,6 +490,7 @@ mod test {
             }
         }
 
+        // SAFETY: DropWatcher's drop implementation does not dereference any garbage-collected pointers.
         unsafe impl Collect<'_> for DropWatcher {
             const NEEDS_TRACE: bool = false;
         }
@@ -487,6 +519,7 @@ mod test {
             let gc1 = gc.write(0);
             assert_eq!(*gc1, 0);
 
+            // SAFETY: `i32` can be safely zero-initialized.
             let gc2 = unsafe { UniqueGc::<i32>::new_zeroed(mc).assume_init() };
             assert_eq!(*gc1, *gc2);
         });
