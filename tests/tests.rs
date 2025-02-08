@@ -5,8 +5,9 @@ use rand::distributions::Distribution;
 use std::{collections::HashMap, rc::Rc};
 
 use gc_arena::{
-    arena::CollectionPhase, metrics::Pacing, static_collect, unsize, Arena, Collect,
-    DynamicRootSet, Gc, GcWeak, Lock, RefLock, Rootable,
+    arena::{rootless_mutate, CollectionPhase},
+    metrics::Pacing,
+    static_collect, unsize, Arena, Collect, DynamicRootSet, Gc, GcWeak, Lock, RefLock, Rootable,
 };
 
 #[test]
@@ -105,6 +106,25 @@ fn dyn_sized_allocation() {
 
     // Check that all counters were dropped.
     assert_eq!(Rc::strong_count(&counter.0), 1);
+}
+
+#[test]
+fn dst_allocation() {
+    rootless_mutate(|mc| {
+        let gc1 = Gc::copy_from_slice(mc, &[0u8, 1, 2, 3, 4]);
+        assert_eq!(*gc1, [0, 1, 2, 3, 4]);
+
+        let rcs = vec![Rc::new(0), Rc::new(1), Rc::new(2)];
+        let gc2 = Gc::clone_from_slice(mc, &rcs);
+        assert_eq!(Rc::strong_count(&gc2[0]), 2);
+        assert_eq!(Rc::strong_count(&gc2[1]), 2);
+        assert_eq!(Rc::strong_count(&gc2[2]), 2);
+
+        let gc3 = Gc::from_vec(mc, rcs);
+        assert_eq!(Rc::strong_count(&gc3[0]), 2);
+        assert_eq!(Rc::strong_count(&gc3[1]), 2);
+        assert_eq!(Rc::strong_count(&gc3[2]), 2);
+    });
 }
 
 #[cfg(feature = "std")]

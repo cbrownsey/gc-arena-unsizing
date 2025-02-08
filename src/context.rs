@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::{
     cell::{Cell, UnsafeCell},
     mem::{self, ManuallyDrop},

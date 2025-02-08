@@ -15,6 +15,7 @@ use crate::{
     gc_weak::GcWeak,
     static_collect::Static,
     types::{GcBox, GcBoxHeader, GcBoxInner, GcColor, Invariant},
+    unique_gc::UniqueGc,
     Finalization,
 };
 
@@ -92,6 +93,58 @@ impl<'gc, T: Collect<'gc> + 'gc> Gc<'gc, T> {
             ptr: mc.allocate(t),
             _invariant: PhantomData,
         }
+    }
+}
+
+impl<'gc> Gc<'gc, str> {
+    /// Creates a new `Gc` pointer by copying the given string.
+    ///
+    /// ```
+    /// # use gc_arena::{Gc, Static};
+    /// # fn main() {
+    /// # gc_arena::arena::rootless_mutate(|mc| {
+    /// let s = Gc::from_str(mc, "Hello, World!");
+    /// println!("{s}");
+    /// # });
+    /// # }
+    /// ```
+    pub fn from_str(mc: &Mutation<'gc>, s: &'gc str) -> Gc<'gc, str> {
+        let gc = UniqueGc::copy_from_slice(mc, s.as_bytes());
+
+        // Safety:
+        // - `str` has the same layout guarantees as `[u8]`.
+        // - The contained `[u8]` must be valid utf-8 since it was copied from a `str`.
+        let gc = unsafe { gc.transmute::<str>() };
+
+        UniqueGc::into_gc(gc)
+    }
+}
+
+impl<'gc, T: Collect<'gc> + 'gc> Gc<'gc, [T]> {
+    /// Creates a new `Gc` pointer by copying each element from the given slice.
+    ///
+    /// If you have a slice with elements which only implement `Clone`, see
+    /// [`Gc::clone_from_slice`].
+    pub fn copy_from_slice(mc: &Mutation<'gc>, s: &[T]) -> Gc<'gc, [T]>
+    where
+        T: Copy,
+    {
+        UniqueGc::into_gc(UniqueGc::copy_from_slice(mc, s))
+    }
+
+    /// Creates a new `Gc` pointer by cloning each element from the given slice.
+    ///
+    /// If you have a slice with elements which also implement `Copy`, consider using
+    /// [`Gc::copy_from_slice`].
+    pub fn clone_from_slice(mc: &Mutation<'gc>, s: &[T]) -> Gc<'gc, [T]>
+    where
+        T: Clone,
+    {
+        UniqueGc::into_gc(UniqueGc::clone_from_slice(mc, s))
+    }
+
+    pub fn from_vec(mc: &Mutation<'gc>, s: alloc::vec::Vec<T>) -> Gc<'gc, [T]> {
+        UniqueGc::into_gc(UniqueGc::from_vec(mc, s))
     }
 }
 

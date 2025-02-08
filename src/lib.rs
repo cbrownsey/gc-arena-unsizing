@@ -27,6 +27,7 @@ pub mod allocator_api;
 
 #[cfg(feature = "hashbrown")]
 mod hashbrown;
+mod unique_gc;
 
 #[doc(hidden)]
 pub use gc_arena_derive::__unelide_lifetimes;
@@ -43,4 +44,5 @@ pub use self::{
     gc_weak::GcWeak,
     lock::{GcLock, GcRefLock, Lock, RefLock},
     static_collect::Static,
+    unique_gc::UniqueGc,
 };
